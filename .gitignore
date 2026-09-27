@@ -1,0 +1,17 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# Системные файлы Windows
+Thumbs.db
+Desktop.ini

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import httpx
 
 from datetime import datetime
@@ -28,7 +29,8 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
+weather_cache = {}
+CACHE_TIME = 600
 
 # =========================================================
 # ПОИСК ГОРОДА
@@ -76,6 +78,32 @@ async def get_city(city_name):
 
 async def get_weather(latitude, longitude):
 
+    # Округляем координаты, чтобы одинаковые города
+    # использовали один элемент кэша
+    cache_key = (
+        round(latitude, 3),
+        round(longitude, 3)
+    )
+
+    # Проверяем кэш
+    cached = weather_cache.get(cache_key)
+
+    if cached:
+
+        saved_time, weather = cached
+
+        if datetime.now().timestamp() - saved_time < CACHE_TIME:
+
+            print(
+                f"Используем кэш для координат "
+                f"{latitude}, {longitude}"
+            )
+
+            return weather
+
+        # Старый кэш удаляем
+        del weather_cache[cache_key]
+
     url = "https://api.open-meteo.com/v1/forecast"
 
     params = {
@@ -108,18 +136,63 @@ async def get_weather(latitude, longitude):
         "forecast_days": 7,
     }
 
-    async with httpx.AsyncClient() as client:
+    # Максимум 3 попытки
+    for attempt in range(3):
 
-        response = await client.get(
-            url,
-            params=params,
-            timeout=10
-        )
+        try:
 
-        response.raise_for_status()
+            async with httpx.AsyncClient() as client:
 
-        return response.json()
+                response = await client.get(
+                    url,
+                    params=params,
+                    timeout=15
+                )
 
+                # Если Open-Meteo временно ограничил запросы
+                if response.status_code == 429:
+
+                    print(
+                        f"Open-Meteo вернул 429. "
+                        f"Попытка {attempt + 1}/3"
+                    )
+
+                    if attempt < 2:
+
+                        # 5 секунд перед второй попыткой,
+                        # 10 секунд перед третьей
+                        await asyncio.sleep(
+                            5 * (attempt + 1)
+                        )
+
+                        continue
+
+                    response.raise_for_status()
+
+                response.raise_for_status()
+
+                weather = response.json()
+
+            # Сохраняем успешный прогноз в кэш
+            weather_cache[cache_key] = (
+                datetime.now().timestamp(),
+                weather
+            )
+
+            return weather
+
+        except httpx.HTTPStatusError:
+
+            if attempt == 2:
+                raise
+
+            await asyncio.sleep(
+                5 * (attempt + 1)
+            )
+
+    raise Exception(
+        "Не удалось получить прогноз от Open-Meteo"
+    )
 
 # =========================================================
 # ОПИСАНИЕ ПОГОДЫ

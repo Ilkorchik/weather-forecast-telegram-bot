@@ -1,10 +1,11 @@
 import os
-import asyncio
 import httpx
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+from timezonefinder import TimezoneFinder
 
 from telegram import (
     Update,
@@ -29,8 +30,19 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# MET Norway требует идентифицировать приложение
+USER_AGENT = "WeatherForecastTelegramBot/1.0"
+
+# Определение часового пояса по координатам
+timezone_finder = TimezoneFinder()
+
+# Кэш городов
+city_cache = {}
+
+# Кэш прогнозов
 weather_cache = {}
-CACHE_TIME = 600
+
 
 # =========================================================
 # ПОИСК ГОРОДА
@@ -38,13 +50,22 @@ CACHE_TIME = 600
 
 async def get_city(city_name):
 
-    url = "https://geocoding-api.open-meteo.com/v1/search"
+    cache_key = city_name.lower().strip()
+
+    if cache_key in city_cache:
+        return city_cache[cache_key]
+
+    url = "https://nominatim.openstreetmap.org/search"
 
     params = {
-        "name": city_name,
-        "count": 1,
-        "language": "ru",
-        "format": "json",
+        "q": city_name,
+        "format": "jsonv2",
+        "limit": 1,
+        "accept-language": "ru",
+    }
+
+    headers = {
+        "User-Agent": USER_AGENT
     }
 
     async with httpx.AsyncClient() as client:
@@ -52,205 +73,213 @@ async def get_city(city_name):
         response = await client.get(
             url,
             params=params,
-            timeout=10
+            headers=headers,
+            timeout=15
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-    if "results" not in data:
+    if not data:
         return None
 
-    result = data["results"][0]
+    result = data[0]
 
-    return {
-        "name": result["name"],
-        "country": result.get("country", ""),
-        "latitude": result["latitude"],
-        "longitude": result["longitude"],
+    latitude = float(result["lat"])
+    longitude = float(result["lon"])
+
+    # Определяем часовой пояс
+    timezone_name = timezone_finder.timezone_at(
+        lat=latitude,
+        lng=longitude
+    )
+
+    if timezone_name is None:
+        timezone_name = "UTC"
+
+    # Получаем название страны
+    address = result.get("display_name", "")
+    parts = [
+        part.strip()
+        for part in address.split(",")
+    ]
+
+    country = parts[-1] if parts else ""
+
+    city = {
+        "name": city_name,
+        "country": country,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone": timezone_name,
     }
+
+    city_cache[cache_key] = city
+
+    return city
 
 
 # =========================================================
-# ПОЛУЧЕНИЕ ПРОГНОЗА
+# ПОЛУЧЕНИЕ ПРОГНОЗА MET NORWAY
 # =========================================================
 
 async def get_weather(latitude, longitude):
 
-    # Округляем координаты, чтобы одинаковые города
-    # использовали один элемент кэша
     cache_key = (
-        round(latitude, 3),
-        round(longitude, 3)
+        round(latitude, 4),
+        round(longitude, 4)
     )
 
-    # Проверяем кэш
-    cached = weather_cache.get(cache_key)
+    # Если прогноз уже загружали —
+    # используем его повторно
+    if cache_key in weather_cache:
 
-    if cached:
+        saved_time, weather = weather_cache[cache_key]
 
-        saved_time, weather = cached
-
-        if datetime.now().timestamp() - saved_time < CACHE_TIME:
-
+        # Кэш действует 30 минут
+        if (
+            datetime.now().timestamp()
+            - saved_time
+            < 1800
+        ):
             print(
-                f"Используем кэш для координат "
-                f"{latitude}, {longitude}"
+                "Используем прогноз из кэша"
             )
 
             return weather
 
-        # Старый кэш удаляем
-        del weather_cache[cache_key]
-
-    url = "https://api.open-meteo.com/v1/forecast"
+    url = (
+        "https://api.met.no/"
+        "weatherapi/locationforecast/2.0/complete"
+    )
 
     params = {
-
-        "latitude": latitude,
-        "longitude": longitude,
-
-        "hourly": (
-            "temperature_2m,"
-            "apparent_temperature,"
-            "relative_humidity_2m,"
-            "precipitation_probability,"
-            "weather_code,"
-            "wind_speed_10m,"
-            "wind_gusts_10m,"
-            "wind_direction_10m"
-        ),
-
-        "daily": (
-            "temperature_2m_max,"
-            "temperature_2m_min,"
-            "weather_code,"
-            "precipitation_probability_max,"
-            "sunrise,"
-            "sunset"
-        ),
-
-        "timezone": "auto",
-
-        "forecast_days": 7,
+        "lat": round(latitude, 4),
+        "lon": round(longitude, 4),
     }
 
-    # Максимум 3 попытки
-    for attempt in range(3):
+    headers = {
+        "User-Agent": USER_AGENT
+    }
 
-        try:
+    async with httpx.AsyncClient() as client:
 
-            async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=20
+        )
 
-                response = await client.get(
-                    url,
-                    params=params,
-                    timeout=15
-                )
+        response.raise_for_status()
 
-                # Если Open-Meteo временно ограничил запросы
-                if response.status_code == 429:
+        weather = response.json()
 
-                    print(
-                        f"Open-Meteo вернул 429. "
-                        f"Попытка {attempt + 1}/3"
-                    )
-
-                    if attempt < 2:
-
-                        # 5 секунд перед второй попыткой,
-                        # 10 секунд перед третьей
-                        await asyncio.sleep(
-                            5 * (attempt + 1)
-                        )
-
-                        continue
-
-                    response.raise_for_status()
-
-                response.raise_for_status()
-
-                weather = response.json()
-
-            # Сохраняем успешный прогноз в кэш
-            weather_cache[cache_key] = (
-                datetime.now().timestamp(),
-                weather
-            )
-
-            return weather
-
-        except httpx.HTTPStatusError:
-
-            if attempt == 2:
-                raise
-
-            await asyncio.sleep(
-                5 * (attempt + 1)
-            )
-
-    raise Exception(
-        "Не удалось получить прогноз от Open-Meteo"
+    weather_cache[cache_key] = (
+        datetime.now().timestamp(),
+        weather
     )
 
+    return weather
+
+
 # =========================================================
-# ОПИСАНИЕ ПОГОДЫ
+# ПРЕОБРАЗОВАНИЕ КОДА ПОГОДЫ MET NORWAY
 # =========================================================
 
-def weather_description(code):
+def weather_description(symbol):
+
+    symbol = symbol.lower()
 
     descriptions = {
 
-        0: "☀️ Ясно",
+        "clearsky": "☀️ Ясно",
 
-        1: "🌤 Преимущественно ясно",
-        2: "⛅ Переменная облачность",
-        3: "☁️ Пасмурно",
+        "fair": "🌤 Преимущественно ясно",
 
-        45: "🌫 Туман",
-        48: "🌫 Туман",
+        "partlycloudy": "⛅ Переменная облачность",
 
-        51: "🌦 Лёгкая морось",
-        53: "🌦 Морось",
-        55: "🌧 Сильная морось",
+        "cloudy": "☁️ Пасмурно",
 
-        61: "🌧 Небольшой дождь",
-        63: "🌧 Дождь",
-        65: "🌧 Сильный дождь",
+        "fog": "🌫 Туман",
 
-        71: "🌨 Небольшой снег",
-        73: "🌨 Снег",
-        75: "❄️ Сильный снег",
+        "lightrain": "🌦 Небольшой дождь",
+        "rain": "🌧 Дождь",
+        "heavyrain": "🌧 Сильный дождь",
 
-        80: "🌦 Небольшой ливень",
-        81: "🌧 Ливень",
-        82: "🌧 Сильный ливень",
+        "lightrainshowers": "🌦 Небольшой ливень",
+        "rainshowers": "🌧 Ливень",
+        "heavyrainshowers": "🌧 Сильный ливень",
 
-        95: "⛈ Гроза",
-        96: "⛈ Гроза с градом",
-        99: "⛈ Сильная гроза с градом",
+        "lightsleet": "🌨 Небольшой мокрый снег",
+        "sleet": "🌨 Мокрый снег",
+        "heavysleet": "🌨 Сильный мокрый снег",
+
+        "lightsleetshowers": "🌨 Небольшой мокрый снег",
+        "sleetshowers": "🌨 Мокрый снег",
+        "heavysleetshowers": "🌨 Сильный мокрый снег",
+
+        "lightsnow": "🌨 Небольшой снег",
+        "snow": "🌨 Снег",
+        "heavysnow": "❄️ Сильный снег",
+
+        "lightsnowshowers": "🌨 Небольшой снег",
+        "snowshowers": "🌨 Снег",
+        "heavysnowshowers": "❄️ Сильный снег",
+
+        "lightrainshowersandthunder": "⛈ Ливень с грозой",
+        "rainshowersandthunder": "⛈ Ливень с грозой",
+        "heavyrainshowersandthunder": "⛈ Сильный ливень с грозой",
+
+        "lightrainandthunder": "⛈ Дождь с грозой",
+        "rainandthunder": "⛈ Дождь с грозой",
+        "heavyrainandthunder": "⛈ Сильный дождь с грозой",
+
+        "lightsnowshowersandthunder": "⛈ Снег с грозой",
+        "snowshowersandthunder": "⛈ Снег с грозой",
+        "heavysnowshowersandthunder": "⛈ Сильный снег с грозой",
+
+        "lightsnowandthunder": "⛈ Снег с грозой",
+        "snowandthunder": "⛈ Снег с грозой",
+        "heavysnowandthunder": "⛈ Сильный снег с грозой",
     }
 
-    return descriptions.get(
-        code,
-        "🌡 Неизвестная погода"
+    for key, description in descriptions.items():
+
+        if symbol.startswith(key):
+            return description
+
+    return "🌡 Неизвестная погода"
+
+
+# =========================================================
+# ВРЕМЯ
+# =========================================================
+
+def local_datetime(time_string, timezone_name):
+
+    dt = datetime.fromisoformat(
+        time_string.replace("Z", "+00:00")
     )
 
+    timezone = ZoneInfo(timezone_name)
 
-# =========================================================
-# ФОРМАТИРОВАНИЕ ВРЕМЕНИ
-# =========================================================
+    return dt.astimezone(timezone)
 
-def format_time(time_string):
+
+def format_time(time_string, timezone_name):
 
     try:
 
-        dt = datetime.fromisoformat(time_string)
+        dt = local_datetime(
+            time_string,
+            timezone_name
+        )
 
         return dt.strftime("%H:%M")
 
-    except:
+    except Exception:
 
         return time_string
 
@@ -261,11 +290,14 @@ def format_time(time_string):
 
 def get_period_data(
     weather,
+    timezone_name,
     start_hour,
     end_hour
 ):
 
-    hourly = weather["hourly"]
+    timeseries = weather[
+        "properties"
+    ]["timeseries"]
 
     temperatures = []
     feels = []
@@ -273,52 +305,122 @@ def get_period_data(
     precipitation = []
     wind = []
     gusts = []
-    codes = []
+    symbols = []
 
-    for i, time_string in enumerate(hourly["time"]):
+    for item in timeseries:
 
-        hour = int(
-            time_string.split("T")[1][:2]
+        dt = local_datetime(
+            item["time"],
+            timezone_name
         )
 
-        if start_hour <= hour < end_hour:
+        hour = dt.hour
 
-            temperatures.append(
-                hourly["temperature_2m"][i]
-            )
+        if not (
+            start_hour <= hour < end_hour
+        ):
+            continue
 
-            feels.append(
-                hourly["apparent_temperature"][i]
-            )
+        instant = item[
+            "data"
+        ].get("instant", {}).get("details", {})
 
+        temperature = instant.get(
+            "air_temperature"
+        )
+
+        humidity_value = instant.get(
+            "relative_humidity"
+        )
+
+        wind_speed = instant.get(
+            "wind_speed"
+        )
+
+        gust = instant.get(
+            "wind_speed_of_gust"
+        )
+
+        if temperature is None:
+            continue
+
+        temperatures.append(
+            temperature
+        )
+
+        # MET Norway не отдаёт отдельную
+        # apparent_temperature как Open-Meteo,
+        # поэтому пока используем температуру
+        # как базовое значение ощущения.
+        feels.append(
+            temperature
+        )
+
+        if humidity_value is not None:
             humidity.append(
-                hourly["relative_humidity_2m"][i]
+                humidity_value
             )
 
-            precipitation.append(
-                hourly["precipitation_probability"][i]
-            )
-
+        if wind_speed is not None:
             wind.append(
-                hourly["wind_speed_10m"][i]
+                wind_speed
             )
 
+        if gust is not None:
             gusts.append(
-                hourly["wind_gusts_10m"][i]
+                gust
             )
 
-            codes.append(
-                hourly["weather_code"][i]
+        # Берём вероятность осадков
+        # и погодный символ
+        period_data = item[
+            "data"
+        ].get("next_1_hours")
+
+        if period_data is None:
+            period_data = item[
+                "data"
+            ].get("next_6_hours")
+
+        if period_data:
+
+            details = period_data.get(
+                "details",
+                {}
             )
+
+            rain_probability = details.get(
+                "probability_of_precipitation"
+            )
+
+            if rain_probability is not None:
+                precipitation.append(
+                    rain_probability
+                )
+
+            symbol = period_data.get(
+                "summary",
+                {}
+            ).get(
+                "symbol_code"
+            )
+
+            if symbol:
+                symbols.append(symbol)
 
     if not temperatures:
         return None
 
-    # Наиболее частый погодный код
-    most_common_code = max(
-        set(codes),
-        key=codes.count
-    )
+    if symbols:
+
+        most_common_symbol = max(
+            set(symbols),
+            key=symbols.count
+        )
+
+    else:
+
+        most_common_symbol = "clearsky"
 
     return {
 
@@ -328,20 +430,36 @@ def get_period_data(
         "min_feels": min(feels),
         "max_feels": max(feels),
 
-        "humidity": sum(humidity) / len(humidity),
+        "humidity": (
+            sum(humidity) / len(humidity)
+            if humidity
+            else 0
+        ),
 
-        "precipitation": max(precipitation),
+        "precipitation": (
+            max(precipitation)
+            if precipitation
+            else 0
+        ),
 
-        "wind": sum(wind) / len(wind),
+        "wind": (
+            sum(wind) / len(wind)
+            if wind
+            else 0
+        ),
 
-        "gust": max(gusts),
+        "gust": (
+            max(gusts)
+            if gusts
+            else 0
+        ),
 
-        "code": most_common_code,
+        "symbol": most_common_symbol,
     }
 
 
 # =========================================================
-# ОПИСАНИЕ ОДНОГО ПЕРИОДА
+# ОПИСАНИЕ ПЕРИОДА
 # =========================================================
 
 def format_period(
@@ -364,7 +482,7 @@ def format_period(
         f"{data['min_feels']:+.0f}..."
         f"{data['max_feels']:+.0f}°C\n"
 
-        f"{weather_description(data['code'])}\n"
+        f"{weather_description(data['symbol'])}\n"
 
         f"💨 "
         f"{data['wind']:.1f} м/с"
@@ -375,59 +493,102 @@ def format_period(
         f"{data['humidity']:.0f}%\n"
 
         f"🌧 Осадки: "
-        f"{data['precipitation']}%\n"
+        f"{data['precipitation']:.0f}%\n"
     )
 
 
 # =========================================================
-# СОЗДАНИЕ ПРОГНОЗА
+# СОЗДАНИЕ ПРОГНОЗА НА СЕГОДНЯ
 # =========================================================
 
 def create_forecast(city, weather):
 
-    daily = weather["daily"]
+    timezone_name = city["timezone"]
 
-    today = daily["time"][0]
+    timeseries = weather[
+        "properties"
+    ]["timeseries"]
 
-    min_temp = daily["temperature_2m_min"][0]
-    max_temp = daily["temperature_2m_max"][0]
+    today = datetime.now(
+        ZoneInfo(timezone_name)
+    ).date()
 
-    sunrise = format_time(
-        daily["sunrise"][0]
+    today_items = []
+
+    for item in timeseries:
+
+        dt = local_datetime(
+            item["time"],
+            timezone_name
+        )
+
+        if dt.date() == today:
+
+            today_items.append(item)
+
+    if not today_items:
+        raise Exception(
+            "Нет данных за сегодняшний день"
+        )
+
+    temperatures = []
+
+    for item in today_items:
+
+        temperature = item[
+            "data"
+        ]["instant"]["details"].get(
+            "air_temperature"
+        )
+
+        if temperature is not None:
+            temperatures.append(
+                temperature
+            )
+
+    min_temp = min(temperatures)
+    max_temp = max(temperatures)
+
+    night = get_period_data(
+        weather,
+        timezone_name,
+        0,
+        6
     )
 
-    sunset = format_time(
-        daily["sunset"][0]
+    morning = get_period_data(
+        weather,
+        timezone_name,
+        6,
+        12
     )
 
-    precipitation = daily[
-        "precipitation_probability_max"
-    ][0]
+    day = get_period_data(
+        weather,
+        timezone_name,
+        12,
+        18
+    )
+
+    evening = get_period_data(
+        weather,
+        timezone_name,
+        18,
+        24
+    )
 
     text = (
 
-        f"🌤 <b>ПРОГНОЗ НА СЕГОДНЯ</b>\n\n"
+        "🌤 <b>ПРОГНОЗ НА СЕГОДНЯ</b>\n\n"
 
         f"📍 <b>{city['name']}</b>, "
-        f"{city['country']}\n"
-
-        f"📅 {today}\n\n"
+        f"{city['country']}\n\n"
 
         f"🌡 Температура за день: "
         f"<b>{min_temp:+.0f}..."
-        f"{max_temp:+.0f}°C</b>\n"
+        f"{max_temp:+.0f}°C</b>\n\n"
 
-        f"🌧 Максимальная вероятность "
-        f"осадков: <b>{precipitation}%</b>\n\n"
-
-        f"────────────────────\n\n"
-    )
-
-    # Ночь
-    night = get_period_data(
-        weather,
-        0,
-        6
+        "────────────────────\n\n"
     )
 
     text += format_period(
@@ -437,13 +598,6 @@ def create_forecast(city, weather):
 
     text += "\n────────────────────\n\n"
 
-    # Утро
-    morning = get_period_data(
-        weather,
-        6,
-        12
-    )
-
     text += format_period(
         "🌅 УТРО",
         morning
@@ -451,26 +605,12 @@ def create_forecast(city, weather):
 
     text += "\n────────────────────\n\n"
 
-    # День
-    day = get_period_data(
-        weather,
-        12,
-        18
-    )
-
     text += format_period(
         "☀️ ДЕНЬ",
         day
     )
 
     text += "\n────────────────────\n\n"
-
-    # Вечер
-    evening = get_period_data(
-        weather,
-        18,
-        24
-    )
 
     text += format_period(
         "🌆 ВЕЧЕР",
@@ -481,10 +621,8 @@ def create_forecast(city, weather):
 
         "\n────────────────────\n\n"
 
-        f"🌅 Восход: <b>{sunrise}</b>\n"
-        f"🌇 Закат: <b>{sunset}</b>\n\n"
-
-        "🌐 Данные: Open-Meteo"
+        "🌐 Данные: MET Norway / "
+        "OpenStreetMap"
     )
 
     return text
@@ -574,8 +712,13 @@ async def city_message(
 
     try:
 
-        # Ищем город
-        city = await get_city(city_name)
+        print(
+            f"Ищу город: {city_name}"
+        )
+
+        city = await get_city(
+            city_name
+        )
 
         if city is None:
 
@@ -591,23 +734,30 @@ async def city_message(
 
             return
 
-        # Получаем погоду
+        print(
+            f"Город найден: "
+            f"{city['name']} "
+            f"({city['latitude']}, "
+            f"{city['longitude']})"
+        )
+
         weather = await get_weather(
             city["latitude"],
             city["longitude"]
         )
 
-        # Создаём прогноз
+        print(
+            "Прогноз получен от MET Norway"
+        )
+
         forecast = create_forecast(
             city,
             weather
         )
 
-        # Сохраняем данные
         context.user_data["city"] = city
         context.user_data["weather"] = weather
 
-        # Отправляем
         await update.message.reply_text(
 
             forecast,
@@ -621,13 +771,14 @@ async def city_message(
 
         print(
             "Ошибка:",
-            error
+            repr(error)
         )
 
         await update.message.reply_text(
 
             "⚠️ <b>Не удалось получить "
             "прогноз.</b>\n\n"
+
             "Попробуй ещё раз.",
 
             parse_mode="HTML"
@@ -635,7 +786,7 @@ async def city_message(
 
 
 # =========================================================
-# ОБРАБОТКА КНОПОК
+# КНОПКИ
 # =========================================================
 
 async def button_handler(
@@ -651,96 +802,172 @@ async def button_handler(
     if query.data == "new_city":
 
         await query.message.reply_text(
-
             "📍 Напиши название нового города."
         )
 
         return
 
+    city = context.user_data.get(
+        "city"
+    )
+
+    weather = context.user_data.get(
+        "weather"
+    )
+
+    if not city or not weather:
+        return
+
     # Сегодня
     if query.data == "today":
 
-        city = context.user_data.get(
-            "city"
+        forecast = create_forecast(
+            city,
+            weather
         )
 
-        weather = context.user_data.get(
-            "weather"
+        await query.message.reply_text(
+
+            forecast,
+
+            parse_mode="HTML",
+
+            reply_markup=create_buttons()
         )
-
-        if city and weather:
-
-            forecast = create_forecast(
-                city,
-                weather
-            )
-
-            await query.message.reply_text(
-
-                forecast,
-
-                parse_mode="HTML",
-
-                reply_markup=create_buttons()
-            )
 
         return
 
     # 7 дней
     if query.data == "week":
 
-        city = context.user_data.get(
-            "city"
-        )
+        timezone_name = city["timezone"]
 
-        weather = context.user_data.get(
-            "weather"
-        )
+        timeseries = weather[
+            "properties"
+        ]["timeseries"]
 
-        if not city or not weather:
-            return
+        days = {}
 
-        daily = weather["daily"]
+        for item in timeseries:
+
+            dt = local_datetime(
+                item["time"],
+                timezone_name
+            )
+
+            date = dt.date()
+
+            if date not in days:
+                days[date] = []
+
+            days[date].append(item)
 
         text = (
-
-            f"📆 <b>ПРОГНОЗ НА 7 ДНЕЙ</b>\n\n"
-
+            "📆 <b>ПРОГНОЗ НА 7 ДНЕЙ</b>\n\n"
             f"📍 <b>{city['name']}</b>\n\n"
         )
 
-        for i in range(7):
+        for date in sorted(days)[:7]:
 
-            date = daily["time"][i]
+            items = days[date]
 
-            min_temp = daily[
-                "temperature_2m_min"
-            ][i]
+            temperatures = []
+            symbols = []
+            rain = []
 
-            max_temp = daily[
-                "temperature_2m_max"
-            ][i]
+            for item in items:
 
-            code = daily[
-                "weather_code"
-            ][i]
+                details = item[
+                    "data"
+                ]["instant"]["details"]
 
-            rain = daily[
-                "precipitation_probability_max"
-            ][i]
+                temperature = details.get(
+                    "air_temperature"
+                )
+
+                if temperature is not None:
+                    temperatures.append(
+                        temperature
+                    )
+
+                period = item[
+                    "data"
+                ].get("next_6_hours")
+
+                if period:
+
+                    period_details = period.get(
+                        "details",
+                        {}
+                    )
+
+                    probability = (
+                        period_details.get(
+                            "probability_of_precipitation"
+                        )
+                    )
+
+                    if probability is not None:
+                        rain.append(
+                            probability
+                        )
+
+                    symbol = period.get(
+                        "summary",
+                        {}
+                    ).get(
+                        "symbol_code"
+                    )
+
+                    if symbol:
+                        symbols.append(symbol)
+
+            if not temperatures:
+                continue
+
+            min_temp = min(
+                temperatures
+            )
+
+            max_temp = max(
+                temperatures
+            )
+
+            if symbols:
+
+                symbol = max(
+                    set(symbols),
+                    key=symbols.count
+                )
+
+            else:
+
+                symbol = "clearsky"
+
+            rain_probability = (
+                max(rain)
+                if rain
+                else 0
+            )
 
             text += (
 
                 f"<b>{date}</b>\n"
 
-                f"{weather_description(code)}\n"
+                f"{weather_description(symbol)}\n"
 
                 f"🌡 "
                 f"{min_temp:+.0f}..."
                 f"{max_temp:+.0f}°C\n"
 
-                f"🌧 Осадки: {rain}%\n\n"
+                f"🌧 Осадки: "
+                f"{rain_probability:.0f}%\n\n"
             )
+
+        text += (
+            "🌐 Данные: MET Norway / "
+            "OpenStreetMap"
+        )
 
         await query.message.reply_text(
 
@@ -789,21 +1016,36 @@ def main():
         "🐡 Weather bot запущен!"
     )
 
-    import os
-
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    render_url = os.environ.get(
+        "RENDER_EXTERNAL_URL"
+    )
 
     if render_url:
-        port = int(os.environ.get("PORT", 10000))
+
+        port = int(
+            os.environ.get(
+                "PORT",
+                10000
+            )
+        )
 
         application.run_webhook(
+
             listen="0.0.0.0",
+
             port=port,
+
             url_path=BOT_TOKEN,
-            webhook_url=f"{render_url}/{BOT_TOKEN}",
+
+            webhook_url=(
+                f"{render_url}/{BOT_TOKEN}"
+            ),
+
             drop_pending_updates=True,
         )
+
     else:
+
         application.run_polling()
 
 

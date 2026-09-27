@@ -713,10 +713,25 @@ def main():
     )
 
     print(
-        "🌤 Weather bot запущен!"
+        "🐡 Weather bot запущен!"
     )
 
-    application.run_polling()
+    import os
+
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if render_url:
+        port = int(os.environ.get("PORT", 10000))
+
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{render_url}/{BOT_TOKEN}",
+            drop_pending_updates=True,
+        )
+    else:
+        application.run_polling()
 
 
 if __name__ == "__main__":
